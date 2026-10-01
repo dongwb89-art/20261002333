@@ -1,0 +1,329 @@
+"""双人坦克对战：蓝方 W/A/S/D + G；红方方向键 + 0。"""
+
+import math
+import turtle
+
+
+# 场地与游戏参数（可按需要调整比例）
+WIDTH, HEIGHT = 900, 650
+EDGE_X, EDGE_Y = WIDTH // 2 - 35, HEIGHT // 2 - 35
+STEP = 24
+BULLET_SPEED = 13
+HIT_DISTANCE = 24
+# 严格的等边三角形：边长 30，三角形重心位于 Turtle 的中心。
+# 0 度时底边中点在 TRIANGLE_BASE，顶点在 TRIANGLE_TIP。
+# 子弹从底边中点沿中线经过顶角射出。
+TRIANGLE_SIDE = 30
+TRIANGLE_HALF_HEIGHT = TRIANGLE_SIDE / 2
+TRIANGLE_ALTITUDE = TRIANGLE_SIDE * (3 ** 0.5) / 2
+TRIANGLE_BASE = -TRIANGLE_ALTITUDE / 3
+TRIANGLE_TIP = TRIANGLE_ALTITUDE * 2 / 3
+MOVE_SPEED = 4
+TURN_SPEED = 4
+# 开局时两个三角形的外观都按顺时针偏转 30 度。
+OPENING_CLOCKWISE_ROTATION = 30
+# ???????? 1.5 ???????????
+# 画面中央竖直中轴线。两名玩家以它为镜面作左右对称。
+AI_MOVE_SPEED = MOVE_SPEED * 1.5
+AI_FIRE_INTERVAL = 18
+AI_DODGE_LOOKAHEAD = 340
+MIDDLE_LINE_X = 0
+START_DISTANCE = 220
+
+screen = turtle.Screen()
+screen.setup(WIDTH, HEIGHT)
+screen.title("双人坦克对战")
+screen.bgcolor("#f4f4f4")
+screen.tracer(0)
+
+
+def make_tank_shape():
+    """注册一个朝右（0 度）的尖锐等腰三角形，尖端就是前方。"""
+    turtle.register_shape(
+        "tank",
+        ((TRIANGLE_BASE, -TRIANGLE_HALF_HEIGHT),
+         (TRIANGLE_BASE, TRIANGLE_HALF_HEIGHT),
+         (TRIANGLE_TIP, 0)),
+    )
+
+
+make_tank_shape()
+
+
+def make_pen(color, position, heading=0):
+    tank = turtle.Turtle("tank")
+    tank.color(color)
+    tank.penup()
+    tank.goto(position)
+    tank.setheading(heading)
+    tank.speed(0)
+    return tank
+
+
+def mirror_across_middle_line(position, heading):
+    """返回 position、heading 关于屏幕中央竖线的左右镜像。"""
+    x, y = position
+    return (2 * MIDDLE_LINE_X - x, y), (180 - heading) % 360
+
+
+# 两者出生点关于中轴线 x=0 左右对称，且处于同一水平线。
+# 两个图形随后各自顺时针偏转相同的 30°。
+BLUE_START = (MIDDLE_LINE_X - START_DISTANCE, 0)
+# 图形分别从相向的 0°、180°顺时针转 30°。
+# 子弹的第一发由 shoot() 单独固定为朝场地中间。
+BLUE_HEADING = (0 - OPENING_CLOCKWISE_ROTATION) % 360
+RED_START = (MIDDLE_LINE_X + START_DISTANCE, 0)
+RED_HEADING = (180 - OPENING_CLOCKWISE_ROTATION) % 360
+
+blue = make_pen("royal blue", BLUE_START, BLUE_HEADING)
+red = make_pen("firebrick", RED_START, RED_HEADING)
+
+players = {
+    "blue": {
+        "tank": blue, "start": BLUE_START, "heading": BLUE_HEADING,
+        "score": 0, "streak": 0,
+    },
+    "red": {
+        "tank": red, "start": RED_START, "heading": RED_HEADING,
+        "score": 0, "streak": 0,
+    },
+}
+bullets = []
+pressed = set()
+round_active = True
+first_shot = {"blue": True, "red": True}
+ai_tick = 0
+
+
+scoreboard = turtle.Turtle(visible=False)
+scoreboard.penup()
+scoreboard.goto(0, HEIGHT // 2 - 48)
+scoreboard.color("#222222")
+
+
+def show_score(message=""):
+    scoreboard.clear()
+    scoreboard.write(
+        f"蓝方：{players['blue']['score']}（连胜 {players['blue']['streak']}）    "
+        f"红方：{players['red']['score']}（连胜 {players['red']['streak']}）\n"
+        "左侧蓝方：W/S 前进后退，A/D 左右转向，G 发射\n"
+        "右侧红方：电脑自动移动、躲避与射击"
+        + (f"\n{message}" if message else ""),
+        align="center",
+        font=("Arial", 13, "normal"),
+    )
+
+
+def in_arena(x, y):
+    return -EDGE_X <= x <= EDGE_X and -EDGE_Y <= y <= EDGE_Y
+
+
+def drive(name, distance):
+    """沿坦克当前尖端方向行驶；负数表示倒退。"""
+    tank = players[name]["tank"]
+    old_position = tank.position()
+    tank.forward(distance)
+    if not in_arena(tank.xcor(), tank.ycor()):
+        tank.goto(old_position)
+
+
+def update_controls():
+    """每一帧读取按住的键，实现连续转向、前进与后退。"""
+    if not round_active:
+        return
+
+    # 左侧蓝方由玩家控制；右侧红方由 update_ai() 控制。
+    for name in ("blue",):
+        tank = players[name]["tank"]
+        if f"{name}_left" in pressed:
+            tank.left(TURN_SPEED)
+        if f"{name}_right" in pressed:
+            tank.right(TURN_SPEED)
+        if f"{name}_forward" in pressed:
+            drive(name, MOVE_SPEED)
+        if f"{name}_backward" in pressed:
+            drive(name, -MOVE_SPEED)
+
+
+def heading_to(source, target):
+    """返回从 source 指向 target 的 Turtle 朝向角。"""
+    return math.degrees(math.atan2(target.ycor() - source.ycor(),
+                                   target.xcor() - source.xcor())) % 360
+
+
+def update_ai():
+    """红方自动游走，靠近蓝方子弹时横向躲避，并定时反击。"""
+    global ai_tick
+    if not round_active:
+        return
+
+    ai_tick += 1
+    red_tank = players["red"]["tank"]
+    blue_tank = players["blue"]["tank"]
+    incoming = [item["shape"] for item in bullets if item["owner"] == "blue"]
+
+    if incoming:
+        threat = min(incoming, key=lambda bullet: bullet.distance(red_tank))
+        if threat.distance(red_tank) < 190:
+            # 沿敌方子弹方向的垂线移动，快速离开弹道。
+            side = 90 if (ai_tick // 18) % 2 == 0 else -90
+            red_tank.setheading(threat.heading() + side)
+            drive("red", MOVE_SPEED * 1.25)
+            return
+
+    # 无近距离威胁时，围绕朝向蓝方的方向小幅游走。
+    wander_heading = heading_to(red_tank, blue_tank) + 42 * math.sin(ai_tick / 22)
+    red_tank.setheading(wander_heading)
+    drive("red", MOVE_SPEED * 0.75)
+
+    if ai_tick % AI_FIRE_INTERVAL == 0:
+        shoot("red", heading_to(red_tank, blue_tank))
+
+
+def update_ai():
+    """Make the red tank predict incoming bullet paths and counterattack."""
+    global ai_tick
+    if not round_active:
+        return
+
+    ai_tick += 1
+    red_tank = players["red"]["tank"]
+    blue_tank = players["blue"]["tank"]
+    incoming = [item["shape"] for item in bullets if item["owner"] == "blue"]
+
+    threats = []
+    for bullet in incoming:
+        angle = math.radians(bullet.heading())
+        direction_x, direction_y = math.cos(angle), math.sin(angle)
+        relative_x = red_tank.xcor() - bullet.xcor()
+        relative_y = red_tank.ycor() - bullet.ycor()
+        forward_distance = relative_x * direction_x + relative_y * direction_y
+        sideways_distance = abs(relative_x * direction_y - relative_y * direction_x)
+        if 0 < forward_distance < AI_DODGE_LOOKAHEAD and sideways_distance < 70:
+            threats.append((forward_distance, bullet, relative_x, relative_y))
+
+    if threats:
+        _, threat, relative_x, relative_y = min(threats, key=lambda item: item[0])
+        angle = math.radians(threat.heading())
+        cross = relative_x * math.sin(angle) - relative_y * math.cos(angle)
+        side = 90 if cross >= 0 else -90
+        red_tank.setheading(threat.heading() + side)
+        drive("red", AI_MOVE_SPEED)
+        return
+
+    wander_heading = heading_to(red_tank, blue_tank) + 42 * math.sin(ai_tick / 22)
+    red_tank.setheading(wander_heading)
+    drive("red", AI_MOVE_SPEED)
+    if ai_tick % AI_FIRE_INTERVAL == 0:
+        shoot("red", heading_to(red_tank, blue_tank))
+
+def shoot(name, heading=None):
+    """从底边中点发射；双方第一发固定射向场地中间。"""
+    tank = players[name]["tank"]
+    if first_shot[name]:
+        heading = 0 if name == "blue" else 180
+        first_shot[name] = False
+    elif heading is None:
+        heading = tank.heading()
+    bullet = turtle.Turtle("circle")
+    bullet.shapesize(0.35, 0.35)
+    bullet.color(tank.pencolor())
+    bullet.penup()
+    bullet.speed(0)
+    bullet.setheading(heading)
+    bullet.goto(tank.xcor(), tank.ycor())
+    # 负方向即三角形底边；之后每一帧向当前尖端方向前进。
+    bullet.forward(TRIANGLE_BASE)
+    bullets.append({"shape": bullet, "owner": name})
+
+
+def respawn(name):
+    player = players[name]
+    player["tank"].goto(player["start"])
+    player["tank"].setheading(player["heading"])
+    player["tank"].showturtle()
+
+
+def clear_bullets():
+    for bullet_data in bullets:
+        bullet_data["shape"].hideturtle()
+    bullets.clear()
+
+
+def start_next_round():
+    """U 键开始下一局；总积分保留。"""
+    global round_active, ai_tick
+    if round_active:
+        return
+    clear_bullets()
+    respawn("blue")
+    respawn("red")
+    pressed.clear()
+    first_shot["blue"] = True
+    first_shot["red"] = True
+    ai_tick = 0
+    round_active = True
+    show_score("下一局开始！")
+
+
+def animate_bullets():
+    global round_active
+    update_controls()
+    update_ai()
+    for bullet_data in bullets[:]:
+        if not round_active:
+            break
+        bullet = bullet_data["shape"]
+        owner = bullet_data["owner"]
+        bullet.forward(BULLET_SPEED)
+        target_name = "red" if owner == "blue" else "blue"
+        target = players[target_name]["tank"]
+
+        if bullet.distance(target) < HIT_DISTANCE:
+            # 第 1 场连胜得 1 分，第 2 场连续胜利得 2 分，依此类推。
+            players[owner]["streak"] += 1
+            players[target_name]["streak"] = 0
+            earned_points = players[owner]["streak"]
+            players[owner]["score"] += earned_points
+            target.hideturtle()
+            round_active = False
+            clear_bullets()
+            winner = "蓝方" if owner == "blue" else "红方"
+            show_score(
+                f"{winner} 击败对方！{players[owner]['streak']} 连胜，本局 +{earned_points} 分。"
+                "按 U 开始下一局"
+            )
+            break
+        elif not in_arena(bullet.xcor(), bullet.ycor()):
+            bullet.hideturtle()
+            bullets.remove(bullet_data)
+
+    screen.update()
+    screen.ontimer(animate_bullets, 20)
+
+
+def bind_hold(key, action):
+    screen.onkeypress(lambda: pressed.add(action), key)
+    screen.onkeyrelease(lambda: pressed.discard(action), key)
+
+
+# 蓝方：W/S 前进后退，A/D 只转向。按住即连续动作。
+bind_hold("w", "blue_forward")
+bind_hold("W", "blue_forward")
+bind_hold("s", "blue_backward")
+bind_hold("S", "blue_backward")
+bind_hold("a", "blue_left")
+bind_hold("A", "blue_left")
+bind_hold("d", "blue_right")
+bind_hold("D", "blue_right")
+screen.onkey(lambda: shoot("blue") if round_active else None, "g")
+screen.onkey(lambda: shoot("blue") if round_active else None, "G")
+
+# 红方（右侧）由电脑自动移动、躲避与射击。
+screen.onkey(start_next_round, "u")
+screen.onkey(start_next_round, "U")
+
+show_score()
+screen.listen()
+animate_bullets()
+turtle.done()
